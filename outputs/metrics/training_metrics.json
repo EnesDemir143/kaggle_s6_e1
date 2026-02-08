@@ -1,0 +1,21 @@
+[
+  {
+    "model": "xgboost",
+    "fold": null,
+    "rmse": 8.709581555814058,
+    "mae": 6.9427960706104095,
+    "r2": 0.7866457960206754,
+    "timestamp": "2026-02-08T18:00:40.538040",
+    "best_params": {
+      "n_estimators": 2282,
+      "learning_rate": 0.02134514709251329,
+      "max_depth": 8,
+      "min_child_weight": 19,
+      "subsample": 0.9685159744881056,
+      "colsample_bytree": 0.5331854500219517,
+      "gamma": 5.032353529627734e-06,
+      "reg_alpha": 0.01702006015297925,
+      "reg_lambda": 6.9631333234286945e-06
+    }
+  }
+]
