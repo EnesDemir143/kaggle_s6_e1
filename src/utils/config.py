@@ -282,6 +282,27 @@ class MLPConfig:
         }
 
 
+@dataclass
+class StackingConfig:
+    """Stacking ensemble with RidgeCV meta-learner."""
+    # RidgeCV alphas to try
+    alphas: tuple = (0.001, 0.01, 0.1, 1.0, 10.0, 100.0)
+    # Whether to fit intercept
+    fit_intercept: bool = True
+    # Cross-validation folds for alpha selection
+    cv: int = 5
+    # Scoring metric
+    scoring: str = "neg_root_mean_squared_error"
+    
+    def to_dict(self) -> dict:
+        return {
+            "alphas": self.alphas,
+            "fit_intercept": self.fit_intercept,
+            "cv": self.cv,
+            "scoring": self.scoring,
+        }
+
+
 # =============================================================================
 # OPTUNA SEARCH SPACES
 # =============================================================================
