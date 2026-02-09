@@ -284,7 +284,23 @@ class MLPConfig:
 
 @dataclass
 class StackingConfig:
-    """Stacking ensemble with RidgeCV meta-learner."""
+    """
+    Stacking ensemble with RidgeCV meta-learner.
+    
+    Calibration Note:
+        When base models use early stopping on the validation set, they become
+        slightly calibrated to that data. Using the same validation set for
+        the meta-learner may lead to optimistic performance estimates.
+        
+        For critical applications, consider using separate validation sets
+        (Train/Val1/Val2 split) where Val1 is for base model early stopping
+        and Val2 is for meta-learner training.
+        
+    Full Refit Note:
+        With stacking, retraining on 100% of data is difficult because the
+        meta-learner needs out-of-fold predictions. The "Blending" approach
+        (current implementation) is the safest solution.
+    """
     # RidgeCV alphas to try
     alphas: tuple = (0.001, 0.01, 0.1, 1.0, 10.0, 100.0)
     # Whether to fit intercept
@@ -387,7 +403,7 @@ class OptunaSearchSpace:
             "activation": trial.suggest_categorical("activation", ["relu", "tanh"]),
             "solver": "adam",
             "alpha": trial.suggest_float("alpha", 1e-5, 1e-1, log=True),
-            "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512, 1024]),
+            "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),  # Large batches for 630K dataset
             "learning_rate_init": trial.suggest_float("learning_rate_init", 1e-4, 1e-2, log=True),
             "max_iter": 500,
             "early_stopping": True,

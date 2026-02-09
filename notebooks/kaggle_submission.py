@@ -517,7 +517,7 @@ def get_mlp_params(trial):
         "activation": trial.suggest_categorical("activation", ["relu", "tanh"]),
         "solver": "adam",
         "alpha": trial.suggest_float("alpha", 1e-5, 1e-1, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512, 1024]),
+        "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),  # Larger batches for GPU efficiency
         "learning_rate_init": trial.suggest_float("learning_rate_init", 1e-4, 1e-2, log=True),
         "max_iter": 500,
         "early_stopping": True,
@@ -624,89 +624,198 @@ def train_with_optuna(model_name, X_train, y_train, X_val, y_val, fitted_objects
 
 # %% [markdown]
 # ---
-# ## 8. Main Training Loop
+# ## 8. Main Training Loop (5-Fold CV)
+#
+# | Feature | Implementation |
+# |---------|----------------|
+# | **CV** | 5-Fold KFold |
+# | **RAM** | Train → Predict → Delete + `gc.collect()` |
+# | **Fold Weighting** | `Weight = 1 / Fold_RMSE` |
+# | **OOF** | Store for stacking/blending |
+# | **Leakage Prevention** | Fit preprocess on train_fold only |
 
 # %%
+import gc
+from sklearn.model_selection import KFold
+
+# =============================================================================
+# 5-FOLD CV CONFIG
+# =============================================================================
+N_FOLDS = 5
+kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+
 # Split features and target
-X = train_df.drop(columns=[TARGET])
+X_raw = train_df.drop(columns=[TARGET])
 y = train_df[TARGET]
 
-# Train/val split (NO CV!)
-X_train_raw, X_val_raw, y_train, y_val = train_test_split(
-    X, y, test_size=VAL_SIZE, random_state=SEED
-)
+# Test data preparation
+test_ids = test_df[ID_COL].values
 
-print(f"📊 Train: {len(X_train_raw):,} | Val: {len(X_val_raw):,}")
+print(f"📊 Training Configuration:")
+print(f"   Folds: {N_FOLDS}")
+print(f"   Train size: {len(X_raw):,}")
+print(f"   Test size: {len(test_df):,}")
 
 # %%
-# Store results
-trained_models = {}
-all_test_preds = {}
-metrics_results = []
+# =============================================================================
+# STORAGE FOR OOF AND TEST PREDICTIONS
+# =============================================================================
+oof_predictions = {m: np.zeros(len(X_raw)) for m in MODELS}
+test_predictions = {m: np.zeros(len(test_df)) for m in MODELS}
+fold_weights = {m: [] for m in MODELS}
+fold_metrics = {m: [] for m in MODELS}
+
+print("✅ Initialized prediction storage")
+
+# %%
+# =============================================================================
+# 5-FOLD TRAINING LOOP
+# =============================================================================
 
 for model_name in MODELS:
-    # Preprocess - fit on train only!
-    X_train, fitted_objects = preprocess(
-        X_train_raw.copy(), model=model_name, fit=True, target=y_train
-    )
-    X_val, _ = preprocess(
-        X_val_raw.copy(), model=model_name, fit=False, fitted_objects=fitted_objects
-    )
+    print(f"\n{'='*70}")
+    print(f"🚀 MODEL: {model_name.upper()}")
+    print(f"{'='*70}")
     
-    # Train with Optuna
-    model, best_params, best_rmse = train_with_optuna(
-        model_name, X_train, y_train, X_val, y_val, fitted_objects
-    )
+    model_test_preds_weighted = np.zeros(len(test_df))
     
-    # Evaluate
-    y_pred_val = model.predict(X_val)
-    metrics = evaluate(y_val.values, y_pred_val)
-    metrics["model"] = model_name
-    metrics_results.append(metrics)
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X_raw)):
+        print(f"\n📁 Fold {fold + 1}/{N_FOLDS}")
+        print("-" * 40)
+        
+        # ---------------------------------------------------------------------
+        # 1. SPLIT DATA
+        # ---------------------------------------------------------------------
+        X_train_fold = X_raw.iloc[train_idx].copy()
+        y_train_fold = y.iloc[train_idx]
+        X_val_fold = X_raw.iloc[val_idx].copy()
+        y_val_fold = y.iloc[val_idx]
+        
+        print(f"   Train: {len(X_train_fold):,} | Val: {len(X_val_fold):,}")
+        
+        # ---------------------------------------------------------------------
+        # 2. PREPROCESS (fit ONLY on train_fold - NO LEAKAGE!)
+        # ---------------------------------------------------------------------
+        X_train, fitted_objects = preprocess(
+            X_train_fold, model=model_name, fit=True, target=y_train_fold
+        )
+        X_val, _ = preprocess(
+            X_val_fold, model=model_name, fit=False, fitted_objects=fitted_objects
+        )
+        X_test, _ = preprocess(
+            test_df.copy(), model=model_name, fit=False, fitted_objects=fitted_objects
+        )
+        
+        # ---------------------------------------------------------------------
+        # 3. TRAIN WITH OPTUNA
+        # ---------------------------------------------------------------------
+        model, best_params, best_rmse = train_with_optuna(
+            model_name, X_train, y_train_fold, X_val, y_val_fold, fitted_objects
+        )
+        
+        # ---------------------------------------------------------------------
+        # 4. PREDICT
+        # ---------------------------------------------------------------------
+        val_pred = model.predict(X_val)
+        test_pred = model.predict(X_test)
+        
+        # ---------------------------------------------------------------------
+        # 5. CALCULATE FOLD RMSE AND WEIGHT
+        # ---------------------------------------------------------------------
+        fold_rmse = np.sqrt(mean_squared_error(y_val_fold, val_pred))
+        fold_weight = 1.0 / fold_rmse
+        
+        metrics = evaluate(y_val_fold.values, val_pred)
+        fold_metrics[model_name].append({
+            "fold": fold + 1,
+            **metrics
+        })
+        
+        print(f"   ✅ RMSE: {fold_rmse:.4f} | Weight: {fold_weight:.4f}")
+        
+        # ---------------------------------------------------------------------
+        # 6. STORE OOF AND WEIGHTED TEST PREDICTIONS
+        # ---------------------------------------------------------------------
+        oof_predictions[model_name][val_idx] = val_pred
+        model_test_preds_weighted += test_pred * fold_weight
+        fold_weights[model_name].append(fold_weight)
+        
+        # ---------------------------------------------------------------------
+        # 7. RAM CLEANUP (CRITICAL!)
+        # ---------------------------------------------------------------------
+        del model, X_train, X_val, X_test, fitted_objects
+        del X_train_fold, X_val_fold, val_pred, test_pred
+        gc.collect()
+        print(f"   🗑️ RAM cleaned")
     
-    print(f"📈 Val Metrics: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, R²={metrics['r2']:.4f}")
+    # -------------------------------------------------------------------------
+    # NORMALIZE TEST PREDICTIONS BY TOTAL FOLD WEIGHT
+    # -------------------------------------------------------------------------
+    total_weight = sum(fold_weights[model_name])
+    test_predictions[model_name] = model_test_preds_weighted / total_weight
     
-    # Predict on test
-    X_test_raw = test_df.copy()
-    test_ids = X_test_raw[ID_COL].values
-    X_test, _ = preprocess(
-        X_test_raw, model=model_name, fit=False, fitted_objects=fitted_objects
-    )
-    test_pred = model.predict(X_test)
-    
-    # Store
-    trained_models[model_name] = model
-    all_test_preds[model_name] = test_pred
+    print(f"\n🎯 {model_name.upper()} Complete!")
+    print(f"   Total fold weight: {total_weight:.4f}")
+    print(f"   Test predictions normalized ✓")
+
+print("\n" + "="*70)
+print("✅ ALL MODELS TRAINED!")
+print("="*70)
 
 # %% [markdown]
 # ---
-# ## 9. Results Summary
+# ## 9. OOF Results & Global Metrics
 
 # %%
-results_df = pd.DataFrame(metrics_results)
-results_df = results_df[["model", "rmse", "mae", "r2"]]
-results_df = results_df.sort_values("rmse")
+# =============================================================================
+# CALCULATE GLOBAL OOF METRICS
+# =============================================================================
+oof_results = []
+
+for model_name in MODELS:
+    oof_rmse = np.sqrt(mean_squared_error(y, oof_predictions[model_name]))
+    oof_mae = mean_absolute_error(y, oof_predictions[model_name])
+    oof_r2 = r2_score(y, oof_predictions[model_name])
+    
+    oof_results.append({
+        "model": model_name,
+        "oof_rmse": oof_rmse,
+        "oof_mae": oof_mae,
+        "oof_r2": oof_r2,
+    })
+    
+    print(f"📊 {model_name.upper()}: OOF RMSE={oof_rmse:.4f}, MAE={oof_mae:.4f}, R²={oof_r2:.4f}")
+
+oof_results_df = pd.DataFrame(oof_results).sort_values("oof_rmse")
 
 print("\n" + "="*60)
-print("📊 FINAL RESULTS")
+print("📊 OOF RESULTS (Sorted by RMSE)")
 print("="*60)
-display(results_df.style.format({
-    "rmse": "{:.4f}",
-    "mae": "{:.4f}",
-    "r2": "{:.4f}",
-}).highlight_min(subset=["rmse", "mae"], color="lightgreen")
- .highlight_max(subset=["r2"], color="lightgreen"))
+display(oof_results_df.style.format({
+    "oof_rmse": "{:.4f}",
+    "oof_mae": "{:.4f}",
+    "oof_r2": "{:.4f}",
+}).highlight_min(subset=["oof_rmse", "oof_mae"], color="lightgreen")
+ .highlight_max(subset=["oof_r2"], color="lightgreen"))
 
 # %%
-# Visualize results
+# Per-fold metrics breakdown
+print("\n📋 Per-Fold Metrics Breakdown:")
+for model_name in MODELS:
+    print(f"\n{model_name.upper()}:")
+    fold_df = pd.DataFrame(fold_metrics[model_name])
+    print(fold_df.to_string(index=False))
+
+# %%
+# Visualize OOF results
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-metrics_names = ["rmse", "mae", "r2"]
+metrics_names = ["oof_rmse", "oof_mae", "oof_r2"]
 colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(MODELS)))
 
 for ax, metric in zip(axes, metrics_names):
-    values = results_df[metric].values
-    bars = ax.bar(results_df["model"], values, color=colors, alpha=0.8)
+    values = oof_results_df[metric].values
+    bars = ax.bar(oof_results_df["model"], values, color=colors, alpha=0.8)
     ax.set_title(f"{metric.upper()}", fontsize=14, fontweight="bold")
     ax.set_ylabel(metric.upper())
     
@@ -715,209 +824,182 @@ for ax, metric in zip(axes, metrics_names):
                 f"{val:.4f}", ha="center", va="bottom", fontsize=10)
 
 plt.tight_layout()
-plt.savefig("model_comparison.png", dpi=150, bbox_inches="tight")
+plt.savefig("oof_model_comparison.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # %% [markdown]
 # ---
-# ## 10. Prediction Analysis
+# ## 10. OOF Prediction Analysis
 
 # %%
-# Predictions vs Actuals for best model
-best_model_name = results_df.iloc[0]["model"]
-best_model = trained_models[best_model_name]
+# Best model based on OOF RMSE
+best_model_name = oof_results_df.iloc[0]["model"]
+best_oof_pred = oof_predictions[best_model_name]
 
-# Get validation predictions
-X_val_best, fitted_best = preprocess(X_val_raw.copy(), model=best_model_name, fit=True, target=y_train)
-y_pred_best = best_model.predict(X_val_best)
+print(f"🏆 Best Model: {best_model_name.upper()} (OOF RMSE: {oof_results_df.iloc[0]['oof_rmse']:.4f})")
 
 fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
 # Scatter plot
-axes[0].scatter(y_val.values, y_pred_best, alpha=0.3, s=5)
-min_val = min(y_val.min(), y_pred_best.min())
-max_val = max(y_val.max(), y_pred_best.max())
+axes[0].scatter(y.values, best_oof_pred, alpha=0.3, s=5)
+min_val = min(y.min(), best_oof_pred.min())
+max_val = max(y.max(), best_oof_pred.max())
 axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
 axes[0].set_xlabel("Actual")
-axes[0].set_ylabel("Predicted")
-axes[0].set_title(f"Predictions vs Actual ({best_model_name})")
+axes[0].set_ylabel("OOF Predicted")
+axes[0].set_title(f"OOF Predictions vs Actual ({best_model_name})")
 
 # Residual plot
-residuals = y_val.values - y_pred_best
-axes[1].scatter(y_pred_best, residuals, alpha=0.3, s=5)
+residuals = y.values - best_oof_pred
+axes[1].scatter(best_oof_pred, residuals, alpha=0.3, s=5)
 axes[1].axhline(y=0, color='r', linestyle='--')
-axes[1].set_xlabel("Predicted")
+axes[1].set_xlabel("OOF Predicted")
 axes[1].set_ylabel("Residual")
-axes[1].set_title("Residuals vs Predicted")
+axes[1].set_title("Residuals vs OOF Predicted")
 
 # Residual histogram
 axes[2].hist(residuals, bins=50, edgecolor='black', alpha=0.7)
 axes[2].axvline(x=0, color='r', linestyle='--')
 axes[2].set_xlabel("Residual")
 axes[2].set_ylabel("Count")
-axes[2].set_title("Residual Distribution")
+axes[2].set_title("OOF Residual Distribution")
 
 plt.tight_layout()
-plt.savefig("prediction_analysis.png", dpi=150, bbox_inches="tight")
+plt.savefig("oof_prediction_analysis.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # %% [markdown]
 # ---
-# ## 11. Feature Importance (Tree Models)
+# ## 11. Fold Weight Analysis
 
 # %%
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-tree_models = ["catboost", "lightgbm", "xgboost"]
+# Visualize fold weights per model
+fig, axes = plt.subplots(1, len(MODELS), figsize=(4*len(MODELS), 4))
 
-for ax, model_name in zip(axes, tree_models):
-    model = trained_models[model_name]
+for ax, model_name in zip(axes, MODELS):
+    weights = fold_weights[model_name]
+    normalized_weights = [w / sum(weights) for w in weights]
     
-    if hasattr(model, "feature_importances_"):
-        feature_names = NUMERIC_COLS + CAT_COLS
-        importances = model.feature_importances_
-        indices = np.argsort(importances)
-        
-        ax.barh(range(len(indices)), importances[indices], alpha=0.8, color='steelblue')
-        ax.set_yticks(range(len(indices)))
-        ax.set_yticklabels([feature_names[i] for i in indices])
-        ax.set_title(f"{model_name.upper()}", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Importance")
+    bars = ax.bar(range(1, N_FOLDS + 1), normalized_weights, color='steelblue', alpha=0.8)
+    ax.set_xlabel("Fold")
+    ax.set_ylabel("Normalized Weight")
+    ax.set_title(f"{model_name.upper()}", fontweight="bold")
+    ax.set_xticks(range(1, N_FOLDS + 1))
+    
+    for bar, val in zip(bars, normalized_weights):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
+                f"{val:.2%}", ha="center", va="bottom", fontsize=9)
 
 plt.tight_layout()
-plt.savefig("feature_importance.png", dpi=150, bbox_inches="tight")
+plt.savefig("fold_weights.png", dpi=150, bbox_inches="tight")
 plt.show()
 
-# %% [markdown]
-# ---
-# ## 12. Stacking Ensemble with RidgeCV Meta-Learner
-
-# %%
-from sklearn.linear_model import RidgeCV
-
-# =============================================================================
-# STACKING CONFIG
-# =============================================================================
-STACKING_ALPHAS = (0.001, 0.01, 0.1, 1.0, 10.0, 100.0)
-STACKING_CV = 5
-
-print("🔧 Stacking Config:")
-print(f"   Meta-learner: RidgeCV")
-print(f"   Alphas: {STACKING_ALPHAS}")
-print(f"   CV folds: {STACKING_CV}")
-
-# %%
-# Collect validation predictions for stacking (out-of-fold predictions)
-print("\n📊 Collecting base model predictions for stacking...")
-
-val_preds_stack = {}
+print("\n📊 Fold Weight Summary:")
 for model_name in MODELS:
-    # Preprocess validation data with fitted objects from training
-    X_train_temp, fitted_temp = preprocess(
-        X_train_raw.copy(), model=model_name, fit=True, target=y_train
-    )
-    X_val_temp, _ = preprocess(
-        X_val_raw.copy(), model=model_name, fit=False, fitted_objects=fitted_temp
-    )
-    
-    # Get validation predictions
-    val_pred = trained_models[model_name].predict(X_val_temp)
-    val_preds_stack[model_name] = val_pred
-    print(f"   {model_name}: {len(val_pred):,} predictions")
+    weights = fold_weights[model_name]
+    normalized = [w / sum(weights) * 100 for w in weights]
+    print(f"   {model_name}: {[f'{w:.1f}%' for w in normalized]}")
 
-# Build stacking features (base model predictions as features)
-X_stack_val = np.column_stack([val_preds_stack[m] for m in MODELS])
-X_stack_test = np.column_stack([all_test_preds[m] for m in MODELS])
-
-print(f"\n✅ Stacking features shape: Val={X_stack_val.shape}, Test={X_stack_test.shape}")
+# %% [markdown]
+# ---
+# ## 12. Inter-Model Blending (Weighted by OOF RMSE)
+#
+# > 💡 **Strategy**: Models with lower OOF RMSE get higher weight in final blend.
+# > Formula: `Weight = 1 / Global_OOF_RMSE`
 
 # %%
-# Train RidgeCV meta-learner
-print("\n🚀 Training RidgeCV Meta-Learner...")
+# =============================================================================
+# CALCULATE INTER-MODEL WEIGHTS
+# =============================================================================
+oof_rmse_dict = {row["model"]: row["oof_rmse"] for _, row in oof_results_df.iterrows()}
+model_weights = {m: 1.0 / oof_rmse_dict[m] for m in MODELS}
+total_model_weight = sum(model_weights.values())
 
-meta_learner = RidgeCV(
-    alphas=STACKING_ALPHAS,
-    fit_intercept=True,
-    cv=STACKING_CV,
-    scoring="neg_root_mean_squared_error",
+# Normalize weights
+normalized_model_weights = {m: w / total_model_weight for m, w in model_weights.items()}
+
+print("📊 Inter-Model Weights (based on 1/OOF_RMSE):")
+print("-" * 50)
+for model_name in MODELS:
+    print(f"   {model_name.upper()}: "
+          f"OOF_RMSE={oof_rmse_dict[model_name]:.4f} → "
+          f"Weight={normalized_model_weights[model_name]:.4f} "
+          f"({normalized_model_weights[model_name]*100:.1f}%)")
+
+# %%
+# =============================================================================
+# FINAL BLENDED PREDICTIONS
+# =============================================================================
+
+# Blend test predictions
+final_test_pred = sum(
+    test_predictions[m] * normalized_model_weights[m]
+    for m in MODELS
 )
 
-meta_learner.fit(X_stack_val, y_val)
+# Blend OOF predictions (for validation)
+final_oof_pred = sum(
+    oof_predictions[m] * normalized_model_weights[m]
+    for m in MODELS
+)
 
-print(f"✅ Best alpha: {meta_learner.alpha_}")
-print(f"   Coefficients: {dict(zip(MODELS, meta_learner.coef_.round(4)))}")
-print(f"   Intercept: {meta_learner.intercept_:.4f}")
+# Evaluate blended OOF
+blend_metrics = evaluate(y.values, final_oof_pred)
+
+print(f"\n🎯 BLENDED OOF Metrics:")
+print(f"   RMSE: {blend_metrics['rmse']:.4f}")
+print(f"   MAE:  {blend_metrics['mae']:.4f}")
+print(f"   R²:   {blend_metrics['r2']:.4f}")
 
 # %%
-# Evaluate stacking on validation
-stacking_val_pred = meta_learner.predict(X_stack_val)
-stacking_metrics = evaluate(y_val.values, stacking_val_pred)
-
-print(f"\n📈 Stacking Validation Metrics:")
-print(f"   RMSE: {stacking_metrics['rmse']:.4f}")
-print(f"   MAE:  {stacking_metrics['mae']:.4f}")
-print(f"   R²:   {stacking_metrics['r2']:.4f}")
-
 # Compare with individual models
-print("\n📊 Comparison with Base Models:")
-print("-" * 50)
+print("\n📊 Final Comparison (OOF Metrics):")
+print("-" * 60)
 print(f"{'Model':<15} {'RMSE':>10} {'MAE':>10} {'R²':>10}")
-print("-" * 50)
-for res in sorted(metrics_results, key=lambda x: x['rmse']):
-    print(f"{res['model']:<15} {res['rmse']:>10.4f} {res['mae']:>10.4f} {res['r2']:>10.4f}")
-print("-" * 50)
-print(f"{'STACKING':<15} {stacking_metrics['rmse']:>10.4f} {stacking_metrics['mae']:>10.4f} {stacking_metrics['r2']:>10.4f}")
-print("-" * 50)
+print("-" * 60)
+for _, row in oof_results_df.iterrows():
+    print(f"{row['model']:<15} {row['oof_rmse']:>10.4f} {row['oof_mae']:>10.4f} {row['oof_r2']:>10.4f}")
+print("-" * 60)
+print(f"{'BLENDED':<15} {blend_metrics['rmse']:>10.4f} {blend_metrics['mae']:>10.4f} {blend_metrics['r2']:>10.4f}")
+print("-" * 60)
 
 # %%
-# Final test predictions with stacking
-stacking_test_pred = meta_learner.predict(X_stack_test)
-
-print(f"\n🎯 Stacking Test Predictions:")
-print(f"   Count: {len(stacking_test_pred):,}")
-print(f"   Min: {stacking_test_pred.min():.2f}")
-print(f"   Max: {stacking_test_pred.max():.2f}")
-print(f"   Mean: {stacking_test_pred.mean():.2f}")
-print(f"   Std: {stacking_test_pred.std():.2f}")
-
-# %%
-# Visualize stacking weights and comparison
+# Visualize blending
 fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
-# 1. Model weights (coefficients)
+# 1. Model weights
 colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(MODELS)))
-bars = axes[0].bar(MODELS, meta_learner.coef_, color=colors, alpha=0.8)
-axes[0].axhline(y=0, color='r', linestyle='--', alpha=0.5)
-axes[0].set_ylabel("Coefficient")
-axes[0].set_title("RidgeCV Model Weights", fontweight="bold")
-for bar, val in zip(bars, meta_learner.coef_):
+bars = axes[0].bar(MODELS, [normalized_model_weights[m] for m in MODELS], color=colors, alpha=0.8)
+axes[0].set_ylabel("Weight")
+axes[0].set_title("Inter-Model Weights (1/OOF_RMSE)", fontweight="bold")
+for bar, m in zip(bars, MODELS):
     axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
-                f"{val:.3f}", ha="center", va="bottom", fontsize=10)
+                f"{normalized_model_weights[m]:.1%}", ha="center", va="bottom", fontsize=10)
 
 # 2. RMSE comparison
-all_rmse = [r['rmse'] for r in sorted(metrics_results, key=lambda x: MODELS.index(x['model']))]
-all_rmse.append(stacking_metrics['rmse'])
-model_labels = MODELS + ['STACKING']
+all_rmse = [oof_rmse_dict[m] for m in MODELS] + [blend_metrics['rmse']]
+model_labels = MODELS + ['BLENDED']
 colors_ext = list(plt.cm.viridis(np.linspace(0.2, 0.8, len(MODELS)))) + ['#ff6b6b']
 bars = axes[1].bar(model_labels, all_rmse, color=colors_ext, alpha=0.8)
-axes[1].set_ylabel("RMSE")
-axes[1].set_title("RMSE Comparison", fontweight="bold")
+axes[1].set_ylabel("OOF RMSE")
+axes[1].set_title("OOF RMSE Comparison", fontweight="bold")
 axes[1].tick_params(axis='x', rotation=45)
 for bar, val in zip(bars, all_rmse):
     axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
                 f"{val:.4f}", ha="center", va="bottom", fontsize=9)
 
 # 3. Predictions comparison (first 100 samples)
-x = np.arange(min(100, len(stacking_test_pred)))
+x = np.arange(min(100, len(final_test_pred)))
 for model_name in MODELS:
-    axes[2].plot(x, all_test_preds[model_name][:100], alpha=0.4, label=model_name, linewidth=1)
-axes[2].plot(x, stacking_test_pred[:100], 'k-', linewidth=2, label='Stacking')
+    axes[2].plot(x, test_predictions[model_name][:100], alpha=0.4, label=model_name, linewidth=1)
+axes[2].plot(x, final_test_pred[:100], 'k-', linewidth=2, label='Blended')
 axes[2].set_xlabel("Sample Index")
 axes[2].set_ylabel("Predicted Score")
-axes[2].set_title("Predictions Comparison", fontweight="bold")
+axes[2].set_title("Test Predictions Comparison", fontweight="bold")
 axes[2].legend(loc='upper right', fontsize=8)
 
 plt.tight_layout()
-plt.savefig("stacking_analysis.png", dpi=150, bbox_inches="tight")
+plt.savefig("blending_analysis.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # %% [markdown]
@@ -925,16 +1007,21 @@ plt.show()
 # ## 13. Submission
 
 # %%
-# Create submission with stacking predictions
+# Create submission with blended predictions
 submission = pd.DataFrame({
     ID_COL: test_ids,
-    TARGET: stacking_test_pred
+    TARGET: final_test_pred
 })
 
 submission.to_csv("submission.csv", index=False)
 print(f"\n✅ Submission saved: submission.csv")
 print(f"   Shape: {submission.shape}")
-print(f"   Method: Stacking with RidgeCV (alpha={meta_learner.alpha_})")
+print(f"   Method: Weighted Blending (1/OOF_RMSE)")
+print(f"\n📊 Test Prediction Stats:")
+print(f"   Min: {final_test_pred.min():.2f}")
+print(f"   Max: {final_test_pred.max():.2f}")
+print(f"   Mean: {final_test_pred.mean():.2f}")
+print(f"   Std: {final_test_pred.std():.2f}")
 
 submission.head(10)
 
@@ -947,9 +1034,12 @@ submission.head(10)
 # | Data Loading | ✅ Loaded train & test data |
 # | EDA | ✅ Complete analysis |
 # | Preprocessing | ✅ Model-specific pipelines |
-# | Optuna Tuning | ✅ 50 trials per model |
+# | **5-Fold CV** | ✅ KFold with fold weighting |
+# | **RAM Optimization** | ✅ Train → Predict → Delete + gc.collect() |
+# | **OOF Predictions** | ✅ Stored for blending |
+# | Optuna Tuning | ✅ 50 trials per model per fold |
 # | Base Models | ✅ CatBoost, LightGBM, XGBoost, MLP |
-# | Stacking | ✅ RidgeCV meta-learner |
+# | **Weighted Blending** | ✅ 1/OOF_RMSE inter-model weights |
 # | Submission | ✅ Generated |
 # 
 # **Good luck! 🚀**

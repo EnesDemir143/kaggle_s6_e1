@@ -79,6 +79,26 @@ Defined in `src/utils/config.py` → `OptunaSearchSpace` class.
 
 ---
 
+## Stacking Ensemble Notes
+
+### Calibration Consideration
+
+| Component | Behavior |
+|-----------|----------|
+| Base Models | Use validation set for early stopping (slight calibration) |
+| Meta-Learner | Trained on same validation predictions |
+| Risk | Meta-learner may overestimate base model performance |
+
+**Production Solution**: Use Train/Val1/Val2 split (Val1 for base models, Val2 for meta-learner).
+
+**Current Approach**: Acceptable for data-limited scenarios (Kaggle).
+
+### Full Train Refit
+
+With stacking, retraining on 100% data is problematic because the meta-learner needs unseen predictions. The current "Blending" approach is the safest solution.
+
+---
+
 ## Related Docs
 
 - [Preprocessing Guide](preprocessing_guide.md) - Data preprocessing details
